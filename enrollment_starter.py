@@ -1,9 +1,9 @@
 """
 Module 8 Student Enrollment backend starter.
 
-This file is intentionally procedural. It has functions and top-level
-database code, but no classes yet. Students will first group related behavior
-into an EnrollmentManager class, then separate service and database layers.
+This file has been refactored into a layered backend architecture.
+The database layer is responsible for SQLite operations only, and the
+service layer is responsible for business logic.
 
 App idea:
     - a student opens a dashboard
@@ -34,7 +34,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 
 DB_PATH = Path(__file__).with_name("student_enrollment_practice.db")
@@ -78,17 +78,42 @@ SAMPLE_ENROLLMENTS = [
 ]
 
 
-def connect() -> sqlite3.Connection:
-    """Open a database connection."""
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
+class DatabaseManager:
+    """Handle SQLite database operations only."""
 
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = db_path
 
-def create_tables() -> None:
-    """Create the courses and enrollments tables."""
-    with connect() as connection:
-        connection.execute(
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.db_path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    @staticmethod
+    def rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+        return [dict(row) for row in rows]
+
+    def fetch_one(self, sql: str, params: tuple[Any, ...] = ()) -> Optional[sqlite3.Row]:
+        with self._connect() as connection:
+            return connection.execute(sql, params).fetchone()
+
+    def fetch_all(self, sql: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            return connection.execute(sql, params).fetchall()
+
+    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Cursor:
+        with self._connect() as connection:
+            cursor = connection.execute(sql, params)
+            connection.commit()
+            return cursor
+
+    def executemany(self, sql: str, param_sequence: Iterable[Sequence[Any]]) -> None:
+        with self._connect() as connection:
+            connection.executemany(sql, param_sequence)
+            connection.commit()
+
+    def create_tables(self) -> None:
+        self.execute(
             """
             CREATE TABLE IF NOT EXISTS courses (
                 course_id TEXT PRIMARY KEY,
@@ -98,7 +123,7 @@ def create_tables() -> None:
             )
             """
         )
-        connection.execute(
+        self.execute(
             """
             CREATE TABLE IF NOT EXISTS enrollments (
                 enrollment_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,11 +138,8 @@ def create_tables() -> None:
             """
         )
 
-
-def seed_sample_data() -> None:
-    """Seed courses, enrollment keys, and a few practice enrollment records."""
-    with connect() as connection:
-        connection.executemany(
+    def seed_courses(self, course_rows: list[dict[str, Any]]) -> None:
+        self.executemany(
             """
             INSERT OR IGNORE INTO courses (
                 course_id, course_name, instructor, enrollment_key
@@ -131,62 +153,60 @@ def seed_sample_data() -> None:
                     course["instructor"],
                     course["enrollment_key"],
                 )
-                for course in AVAILABLE_COURSE_KEYS
+                for course in course_rows
             ],
         )
-        connection.executemany(
+
+    def seed_enrollments(self, enrollment_rows: list[tuple[str, str, str, str]]) -> None:
+        self.executemany(
             """
             INSERT OR IGNORE INTO enrollments (user_id, email, course_id, status)
             VALUES (?, ?, ?, ?)
             """,
-            SAMPLE_ENROLLMENTS,
+            enrollment_rows,
         )
 
 
-def rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
-    """Convert SQLite rows into dictionaries."""
-    return [dict(row) for row in rows]
+class EnrollmentService:
+    """Handle business logic for student enrollment workflows."""
 
+    def __init__(self, db_manager: DatabaseManager) -> None:
+        self.db_manager = db_manager
 
-def get_available_course_keys() -> list[dict[str, Any]]:
-    """Return the course keys that a UI could show for practice."""
-    with connect() as connection:
-        rows = connection.execute(
+    @staticmethod
+    def normalize_enrollment_key(enrollment_key: str) -> str:
+        return enrollment_key.strip().upper()
+
+    def get_available_course_keys(self) -> list[dict[str, Any]]:
+        rows = self.db_manager.fetch_all(
             """
             SELECT course_id, course_name, instructor, enrollment_key
             FROM courses
             ORDER BY course_id
             """
-        ).fetchall()
+        )
+        return DatabaseManager.rows_to_dicts(rows)
 
-    return rows_to_dicts(rows)
+    def get_course_by_key(self, enrollment_key: str) -> Optional[dict[str, Any]]:
+        if not enrollment_key:
+            return None
 
-
-def get_course_by_key(enrollment_key: str) -> Optional[dict[str, Any]]:
-    """Find a course by its enrollment key."""
-    if not enrollment_key:
-        return None
-
-    with connect() as connection:
-        row = connection.execute(
+        normalized_key = self.normalize_enrollment_key(enrollment_key)
+        row = self.db_manager.fetch_one(
             """
             SELECT course_id, course_name, instructor, enrollment_key
             FROM courses
             WHERE enrollment_key = ?
             """,
-            (enrollment_key.strip().upper(),),
-        ).fetchone()
+            (normalized_key,),
+        )
+        return dict(row) if row else None
 
-    return dict(row) if row else None
+    def get_student_enrollments(self, user_id: str) -> list[dict[str, Any]]:
+        if not user_id:
+            return []
 
-
-def get_student_enrollments(user_id: str) -> list[dict[str, Any]]:
-    """Return the classes where the student is currently enrolled."""
-    if not user_id:
-        return []
-
-    with connect() as connection:
-        rows = connection.execute(
+        rows = self.db_manager.fetch_all(
             """
             SELECT
                 e.enrollment_id,
@@ -203,18 +223,14 @@ def get_student_enrollments(user_id: str) -> list[dict[str, Any]]:
             ORDER BY c.course_id
             """,
             (user_id, STATUS_ENROLLED),
-        ).fetchall()
+        )
+        return DatabaseManager.rows_to_dicts(rows)
 
-    return rows_to_dicts(rows)
+    def get_student_enrollment_history(self, user_id: str) -> list[dict[str, Any]]:
+        if not user_id:
+            return []
 
-
-def get_student_enrollment_history(user_id: str) -> list[dict[str, Any]]:
-    """Return all enrollment records for one student, including unenrolled."""
-    if not user_id:
-        return []
-
-    with connect() as connection:
-        rows = connection.execute(
+        rows = self.db_manager.fetch_all(
             """
             SELECT
                 e.enrollment_id,
@@ -231,47 +247,41 @@ def get_student_enrollment_history(user_id: str) -> list[dict[str, Any]]:
             ORDER BY c.course_id
             """,
             (user_id,),
-        ).fetchall()
+        )
+        return DatabaseManager.rows_to_dicts(rows)
 
-    return rows_to_dicts(rows)
+    def get_student_course_record(
+        self,
+        user_id: str,
+        course_id: str,
+    ) -> Optional[dict[str, Any]]:
+        if not user_id or not course_id:
+            return None
 
-
-def get_student_course_record(
-    user_id: str,
-    course_id: str,
-) -> Optional[dict[str, Any]]:
-    """Return one student's enrollment record for one course."""
-    if not user_id or not course_id:
-        return None
-
-    with connect() as connection:
-        row = connection.execute(
+        row = self.db_manager.fetch_one(
             """
             SELECT enrollment_id, user_id, email, course_id, status, enrolled_at
             FROM enrollments
             WHERE user_id = ? AND course_id = ?
             """,
             (user_id, course_id),
-        ).fetchone()
+        )
+        return dict(row) if row else None
 
-    return dict(row) if row else None
+    def enroll_with_key(
+        self,
+        user_id: str,
+        email: str,
+        enrollment_key: str,
+    ) -> Optional[dict[str, Any]]:
+        if not user_id or not email or "@" not in email or not enrollment_key:
+            return None
 
+        course = self.get_course_by_key(enrollment_key)
+        if not course:
+            return None
 
-def enroll_with_key(
-    user_id: str,
-    email: str,
-    enrollment_key: str,
-) -> Optional[dict[str, Any]]:
-    """Enroll or reactivate a student using a course enrollment key."""
-    if not user_id or not email or "@" not in email or not enrollment_key:
-        return None
-
-    course = get_course_by_key(enrollment_key)
-    if not course:
-        return None
-
-    with connect() as connection:
-        connection.execute(
+        self.db_manager.execute(
             """
             INSERT INTO enrollments (user_id, email, course_id, status)
             VALUES (?, ?, ?, ?)
@@ -283,17 +293,13 @@ def enroll_with_key(
             """,
             (user_id, email, course["course_id"], STATUS_ENROLLED),
         )
+        return self.get_student_course_record(user_id, course["course_id"])
 
-    return get_student_course_record(user_id, course["course_id"])
+    def soft_unenroll_student(self, user_id: str, course_id: str) -> bool:
+        if not user_id or not course_id:
+            return False
 
-
-def soft_unenroll_student(user_id: str, course_id: str) -> bool:
-    """Soft-unenroll one student by changing status instead of deleting."""
-    if not user_id or not course_id:
-        return False
-
-    with connect() as connection:
-        cursor = connection.execute(
+        cursor = self.db_manager.execute(
             """
             UPDATE enrollments
             SET status = ?
@@ -301,31 +307,25 @@ def soft_unenroll_student(user_id: str, course_id: str) -> bool:
             """,
             (STATUS_UNENROLLED, user_id, course_id),
         )
+        return cursor.rowcount > 0
 
-    return cursor.rowcount > 0
+    def get_student_summary(self, user_id: str) -> dict[str, int]:
+        summary = {
+            "total_records": 0,
+            STATUS_ENROLLED: 0,
+            STATUS_UNENROLLED: 0,
+        }
 
+        for record in self.get_student_enrollment_history(user_id):
+            summary["total_records"] += 1
+            status = record["status"]
+            if status in summary:
+                summary[status] += 1
 
-def get_student_summary(user_id: str) -> dict[str, int]:
-    """Return summary counts for one student."""
-    summary = {
-        "total_records": 0,
-        STATUS_ENROLLED: 0,
-        STATUS_UNENROLLED: 0,
-    }
+        return summary
 
-    for record in get_student_enrollment_history(user_id):
-        summary["total_records"] += 1
-        status = record["status"]
-        if status in summary:
-            summary[status] += 1
-
-    return summary
-
-
-def get_all_enrollment_records() -> list[dict[str, Any]]:
-    """Return every enrollment record for the database snapshot."""
-    with connect() as connection:
-        rows = connection.execute(
+    def get_all_enrollment_records(self) -> list[dict[str, Any]]:
+        rows = self.db_manager.fetch_all(
             """
             SELECT
                 e.enrollment_id,
@@ -340,25 +340,30 @@ def get_all_enrollment_records() -> list[dict[str, Any]]:
             JOIN courses c ON c.course_id = e.course_id
             ORDER BY e.user_id, e.course_id
             """
-        ).fetchall()
+        )
+        return DatabaseManager.rows_to_dicts(rows)
 
-    return rows_to_dicts(rows)
 
-
-def export_database_snapshot(path: Path = SNAPSHOT_PATH) -> None:
-    """Write seeded database content to JSON so students can inspect it."""
+def export_database_snapshot(
+    service: EnrollmentService,
+    current_student: dict[str, Any],
+    path: Path = SNAPSHOT_PATH,
+) -> None:
     snapshot = {
-        "current_student": CURRENT_STUDENT,
-        "available_course_keys": get_available_course_keys(),
-        "enrollment_table": get_all_enrollment_records(),
+        "current_student": current_student,
+        "available_course_keys": service.get_available_course_keys(),
+        "enrollment_table": service.get_all_enrollment_records(),
     }
     path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
 
 
 def main() -> None:
-    """Small terminal runner for checking behavior before the UI exists."""
-    create_tables()
-    seed_sample_data()
+    db_manager = DatabaseManager(DB_PATH)
+    service = EnrollmentService(db_manager)
+
+    db_manager.create_tables()
+    db_manager.seed_courses(AVAILABLE_COURSE_KEYS)
+    db_manager.seed_enrollments(SAMPLE_ENROLLMENTS)
 
     user_id = CURRENT_STUDENT["user_id"]
     email = CURRENT_STUDENT["email"]
@@ -367,21 +372,21 @@ def main() -> None:
     print(CURRENT_STUDENT)
 
     print("\nAvailable enrollment keys:")
-    print(get_available_course_keys())
+    print(service.get_available_course_keys())
 
     print("\nInitial enrolled classes:")
-    print(get_student_enrollments(user_id))
+    print(service.get_student_enrollments(user_id))
 
     print("\nStudent enters key DATA210-SPRING:")
-    print(enroll_with_key(user_id, email, "DATA210-SPRING"))
+    print(service.enroll_with_key(user_id, email, "DATA210-SPRING"))
 
     print("\nUpdated enrolled classes:")
-    print(get_student_enrollments(user_id))
+    print(service.get_student_enrollments(user_id))
 
     print("\nStudent summary:")
-    print(get_student_summary(user_id))
+    print(service.get_student_summary(user_id))
 
-    export_database_snapshot()
+    export_database_snapshot(service, CURRENT_STUDENT)
     print(f"\nDatabase snapshot written to: {SNAPSHOT_PATH}")
 
 
